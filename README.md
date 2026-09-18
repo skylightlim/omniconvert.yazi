@@ -21,18 +21,35 @@ a right-click menu of valid targets, rather than a command line to remember.
 
 ## Install
 
-Two steps: the plugin, then the converter script it drives.
+Two pieces to install: the plugin, and the `omniconvert` script that does the
+converting.
 
 ```sh
 ya pkg add skylightlim/omniconvert
+
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/skylightlim/omniconvert.yazi/main/omniconvert \
+  -o ~/.local/bin/omniconvert && chmod +x ~/.local/bin/omniconvert
 ```
 
-That installs the plugin and drops the `omniconvert` script alongside it. Put the
-script on your `PATH`:
+The second command is not optional. `ya pkg` only deploys a plugin's Lua, README
+and LICENSE, so it does not carry the script across — and the plugin is only a
+menu without it. Make sure `~/.local/bin` is on your `PATH`.
+
+<details>
+<summary>Or clone, which gets both at once</summary>
 
 ```sh
+git clone https://github.com/skylightlim/omniconvert.yazi \
+  ~/.config/yazi/plugins/omniconvert.yazi
 ln -s ~/.config/yazi/plugins/omniconvert.yazi/omniconvert ~/.local/bin/omniconvert
 ```
+
+A symlink means `git pull` updates the plugin and the script together. You give up
+`ya pkg upgrade` for this plugin, which will not touch a directory it did not
+deploy.
+
+</details>
 
 Then bind the menu in `~/.config/yazi/keymap.toml`:
 
@@ -43,16 +60,11 @@ run  = "plugin omniconvert"
 desc = "Convert to… (menu)"
 ```
 
-<details>
-<summary>Without <code>ya pkg</code></summary>
+Check it landed:
 
 ```sh
-git clone https://github.com/skylightlim/omniconvert.yazi \
-  ~/.config/yazi/plugins/omniconvert.yazi
-ln -s ~/.config/yazi/plugins/omniconvert.yazi/omniconvert ~/.local/bin/omniconvert
+omniconvert list
 ```
-
-</details>
 
 ## How it works
 
