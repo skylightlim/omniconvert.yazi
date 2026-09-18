@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# omniconvert — FileConverter-style batch media conversion for Linux
+# Usage:
+#   omniconvert <target-ext> [files...]      convert files (one output each)
+#   omniconvert pdf --merge <images...>      merge images into ONE pdf
+#   omniconvert targets <file|ext>...        list valid targets shared by all inputs
+#   omniconvert list                         show supported formats
+set -u -o pipefail
+
+# ---------- tunables (override from the environment if you like) ----------
+JPG_QUALITY=${JPG_QUALITY:-90}    WEBP_QUALITY=${WEBP_QUALITY:-85}
+AVIF_QUALITY=${AVIF_QUALITY:-55}  HEIC_QUALITY=${HEIC_QUALITY:-80}
+PDF_DPI=${PDF_DPI:-200}           GIF_FPS=${GIF_FPS:-12}
+GIF_WIDTH=${GIF_WIDTH:-720}       MP3_VBR=${MP3_VBR:-2}
+VIDEO_CRF=${VIDEO_CRF:-23}
+
+# ---------- what can come in ----------
+IMG_IN_RE='^(bmp|gif|jpe?g|p[bgp]m|tga|tiff?|png|webp|avif|heic|heif|jxl|ico|svg|psd|dng|cr2|cr3|nef|arw|orf|rw2|raf|pef)$'
+AUD_IN_RE='^(aac|flac|m4a|mp3|mp2|ogg|oga|opus|wav|wave|wma|aiff?|amr|ac3|dts|mka|wv)$'
+VID_IN_RE='^(mp4|m4v|mkv|webm|mov|avi|flv|wmv|mpg|mpeg|vob|ts|3gp|3g2|ogv|mts|m2ts|f4v)$'
+# Documents split by LibreOffice module: each module exports a different set.
+WDOC_IN_RE='^(doc|docx|odt|rtf|txt|md|markdown|fodt|dotx?)$'   # full Writer
+WEB_IN_RE='^(html?|xhtml)$'                                    # Writer/Web (limited exports)
+SHEET_IN_RE='^(xls|xlsx|xlsm|ods|fods|csv|tsv)$'               # Calc
+PRES_IN_RE='^(ppt|pptx|pps|ppsx|odp|fodp)$'                    # Impress
+
+# ---------- what can go out ----------
+IMG_OUT='png jpg webp avif heic jxl gif bmp tiff tga ico pdf'
+AUD_OUT='mp3 opus aac m4a flac wav ogg wma'
+VID_OUT='mp4 webm mkv mov avi flv wmv gif'
+PDF_OUT='png jpg webp avif tiff'          # pdf -> raster images
+WDOC_OUT='pdf docx odt rtf txt html'      # verified against LibreOffice Writer
+WEB_OUT='pdf odt txt'                     # Writer/Web cannot emit docx/rtf
+SHEET_OUT='pdf xlsx ods csv'
+PRES_OUT='pdf pptx odp'
+
+IMG_OUT_RE='^(png|jpe?g|webp|avif|heic|heif|jxl|gif|bmp|tga|tiff?|ico|pdf)$'
+AUD_OUT_RE='^(mp3|opus|aac|m4a|flac|wav|ogg|wma)$'
+VID_OUT_RE='^(mp4|webm|mkv|mov|avi|flv|wmv|gif)$'
+DOC_OUT_RE='^(pdf|docx|odt|rtf|txt|html?|xlsx|ods|csv|pptx|odp)$'
+
+usage() { cat <<'EOF'
+omniconvert — FileConverter-style conversion
+
+Usage:
+  omniconvert <target-ext> [files...]      convert files (one output each)
+  omniconvert pdf --merge [images...]      merge images into ONE pdf
+  omniconvert targets <file|ext>...        list valid targets shared by all inputs
+  omniconvert list                         show supported formats
+
+Examples:
+  omniconvert webp photo.png          omniconvert mp3 song.flac
+  omniconvert mp4 clip.mov            omniconvert pdf letter.docx
+  omniconvert jpg scan.pdf            omniconvert pdf --merge a.jpg b.png
+  omniconvert docx notes.md           omniconvert targets photo.png
+EOF
+}
+
+list() { cat <<EOF
+Images  in : bmp gif jpg png tiff tga ico webp avif heic jxl psd svg dng cr2 nef arw ...
+Images  out: $IMG_OUT
+Audio   in : mp3 flac wav ogg opus aac m4a wma aiff amr ac3 ...
+Audio   out: $AUD_OUT
+Video   in : mp4 m4v mkv webm mov avi flv wmv mpg ts 3gp ogv ...
+Video   out: $VID_OUT (+ any audio format = extract soundtrack)
+PDF     in : pdf
+PDF     out: $PDF_OUT
+Docs    in : doc docx odt rtf txt md        -> $WDOC_OUT
+             html htm                       -> $WEB_OUT
+             xls xlsx ods csv tsv           -> $SHEET_OUT
+             ppt pptx odp                   -> $PRES_OUT
+EOF
+}
+
+ext() { local b=${1##*/}; [[ $b == *.* && $b != .* ]] && printf '%s' "${b##*.}" || printf ''; }
+safe() { [[ $1 == -* ]] && printf './%s' "$1" || printf '%s' "$1"; }
+
+# OMNICONVERT_NO_LOG=1 (set by the yazi plugin): write to the pipe instead of the
+# logfile and skip notify-send — the plugin reports the result itself.
+notify() {
+  [[ ${OMNICONVERT_NO_LOG:-} == 1 ]] && return 0
+  command -v notify-send >/dev/null && notify-send -a omniconvert "$@" || true
+}
+
+fresh_path() { # first non-existing path like <dir>/<stem>-N.<ext>
+  local out=$1 i=1 dir="" base=$1 stem ext2
+  [[ $1 == */* ]] && { dir="${1%/*}/"; base="${1##*/}"; }
+  stem=$base ext2=""
+  if [[ $base == *.* && $base != .* ]]; then stem="${base%.*}"; ext2="${base##*.}"; fi
+  while [[ -e $out ]]; do
+    i=$((i + 1))
+    if [[ -n $ext2 ]]; then out="${dir}${stem}-${i}.${ext2}"; else out="${dir}${stem}-${i}"; fi
+  done
+  printf '%s' "$out"
+}
+
+dst_for() { # $1=src  $2=target-ext
+  local dir="" base=$1
+  [[ $1 == */* ]] && { dir="${1%/*}/"; base="${1##*/}"; }
+  [[ $base == *.* && $base != .* ]] && base="${base%.*}"
+  printf '%s%s.%s' "$dir" "$base" "$2"
+}
+
+# ---------- capability query (single source of truth for the yazi plugin) ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+needs_tool() { # $1=src-ext $2=target-ext -> prints the command that does this pair
+  local e=$1 t=$2
+  if [[ $e == pdf ]]; then
+    case $t in
+      png|jpg|jpeg|tif|tiff) printf 'pdftoppm' ;;
+      *)                     printf 'magick' ;;
+    esac
+  elif [[ $e =~ $WDOC_IN_RE || $e =~ $WEB_IN_RE || $e =~ $SHEET_IN_RE || $e =~ $PRES_IN_RE ]]; then
+    printf 'soffice'
+  elif [[ $e =~ $IMG_IN_RE ]]; then
+    printf 'magick'
+  elif [[ $e =~ $AUD_IN_RE || $e =~ $VID_IN_RE ]]; then
+    printf 'ffmpeg'
+  else
+    return 1
+  fi
+}
+
+# $1=ext, $2=anything to skip the "is the tool installed" filter.
+targets_for() { # -> one valid target per line, self excluded
+  local e=${1,,} nocheck=${2:-} set=""
+  if   [[ $e == pdf ]];          then set=$PDF_OUT
+  elif [[ $e =~ $WDOC_IN_RE ]];  then set=$WDOC_OUT
+  elif [[ $e =~ $WEB_IN_RE ]];   then set=$WEB_OUT
+  elif [[ $e =~ $SHEET_IN_RE ]]; then set=$SHEET_OUT
+  elif [[ $e =~ $PRES_IN_RE ]];  then set=$PRES_OUT
+  elif [[ $e =~ $IMG_IN_RE ]];   then set=$IMG_OUT
+  elif [[ $e =~ $AUD_IN_RE ]];   then set=$AUD_OUT
+  elif [[ $e =~ $VID_IN_RE ]];   then set="$VID_OUT $AUD_OUT"
+  else return 1
+  fi
+  local t tool
+  for t in $set; do
+    # skip a no-op conversion (jpg/jpeg and tif/tiff count as the same format)
+    case "$e:$t" in
+      jpeg:jpg|jpg:jpeg|tif:tiff|tiff:tif) continue ;;
+    esac
+    [[ $t == "$e" ]] && continue
+    # Don't offer what this machine can't actually run.
+    if [[ -z $nocheck ]]; then
+      tool=$(needs_tool "$e" "$t") || continue
+      have "$tool" || continue
+    fi
+    printf '%s\n' "$t"
+  done
+}
+
+targets() { # args are files or bare extensions; prints the intersection
+  (( $# )) || { echo "omniconvert: targets needs at least one file or extension" >&2; return 1; }
+  local acc="" first=1 a e list cur t keep
+  for a in "$@"; do
+    e=$(ext "$a"); [[ -z $e ]] && e=$a       # allow a bare extension
+    list=$(targets_for "$e") || return 1     # unsupported input -> no targets
+    if (( first )); then acc=$list; first=0; continue; fi
+    keep=""
+    while IFS= read -r t; do
+      [[ -n $t ]] && grep -qxF "$t" <<<"$list" && keep+="$t"$'\n'
+    done <<<"$acc"
+    acc=${keep%$'\n'}
+    [[ -z $acc ]] && return 1
+  done
+  printf '%s\n' "$acc"
+}
+
+audio_args() { case $1 in
+  mp3)     A_ARGS=(-c:a libmp3lame -q:a "$MP3_VBR") ;;
+  opus)    A_ARGS=(-c:a libopus -b:a 128k) ;;
+  aac|m4a) A_ARGS=(-c:a aac -b:a 192k) ;;
+  flac)    A_ARGS=(-c:a flac) ;;
+  wav)     A_ARGS=(-c:a pcm_s16le) ;;
+  ogg)     A_ARGS=(-c:a libvorbis -q:a 5) ;;
+  wma)     A_ARGS=(-c:a wmav2 -b:a 192k) ;;
+esac; }
+
+video_args() { case $1 in
+  mp4|mov) V_ARGS=(-c:v libx264 -preset medium -crf "$VIDEO_CRF" -pix_fmt yuv420p -c:a aac -b:a 160k -movflags +faststart) ;;
+  mkv)     V_ARGS=(-c:v libx264 -preset medium -crf "$VIDEO_CRF" -c:a aac -b:a 160k) ;;
+  webm)    V_ARGS=(-c:v libvpx-vp9 -crf 32 -b:v 0 -row-mt 1 -deadline good -cpu-used 2 -c:a libopus -b:a 128k) ;;
+  avi)     V_ARGS=(-c:v mpeg4 -q:v 5 -c:a libmp3lame -q:a 4) ;;
+  flv)     V_ARGS=(-c:v libx264 -profile:v baseline -pix_fmt yuv420p -c:a aac -b:a 128k) ;;
+  wmv)     V_ARGS=(-c:v wmv2 -q:v 4 -c:a wmav2 -b:a 160k) ;;
+esac; }
+
+img_convert() { # $1=src $2=dst
+  local e=${2##*.}
+  case $e in
+    jpg|jpeg)  magick "$1" -background white -alpha remove -alpha off -quality "$JPG_QUALITY" "$2" ;;
+    webp)      magick "$1" -quality "$WEBP_QUALITY" "$2" ;;
+    avif)      magick "$1" -quality "$AVIF_QUALITY" "$2" ;;
+    heic|heif) magick "$1" -quality "$HEIC_QUALITY" "$2" ;;
+    pdf)       magick "$1" -quality "$JPG_QUALITY" "$2" ;;
+    ico)       magick "$1" -resize 256x256 -define icon:auto-resize=256,192,128,96,64,48,40,32,24,16 "$2" ;;
+    *)         magick "$1" "$2" ;;
+  esac
+}
+
+vid_to_gif() { # $1=src $2=dst
+  "${FF[@]}" -i "$1" \
+    -vf "fps=$GIF_FPS,scale=$GIF_WIDTH:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse" \
+    -loop 0 "$2"
+}
+
+pdf_to_img() { # $1=src $2=dst
+  # pdftoppm names its own flag and output suffix per format, and neither always
+  # matches the extension we were asked for (-tiff writes .tif), so map both and
+  # rename afterwards when they differ.
+  local fmt=${2##*.} pp sfx base pages out p rc=0
+  case $fmt in
+    png)      pp=png;  sfx=png ;;
+    jpg|jpeg) pp=jpeg; sfx=jpg ;;
+    tif|tiff) pp=tiff; sfx=tif ;;
+    *) # webp/avif/heic/... via ghostscript
+       local n out2 i rc2=0
+       n=$(pdfinfo "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}'); n=${n:-1}
+       if (( n > 1 )); then
+         # One file per page, to match the pdftoppm formats above. Without this
+         # magick would fold every page into one multi-frame file.
+         for ((i = 1; i <= n; i++)); do
+           out2=$(fresh_path "${2%.*}-${i}.${fmt}")
+           magick -density "$PDF_DPI" "$1[$((i - 1))]" "$out2" || rc2=1
+           [[ -f $out2 ]] || rc2=1
+         done
+         OUT_NOTE="${2%.*}-1.${fmt} … -${n}.${fmt} ($n pages)"
+         OUT_NOTE=${OUT_NOTE##*/}
+       else
+         magick -density "$PDF_DPI" "$1" "$2" || rc2=1
+       fi
+       return $rc2 ;;
+  esac
+  base=${2%.*}
+  pages=$(pdfinfo "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}'); pages=${pages:-1}
+  if (( pages > 1 )); then
+    for ((p = 1; p <= pages; p++)); do
+      out=$(fresh_path "${base}-${p}.${fmt}")
+      pdftoppm "-$pp" -r "$PDF_DPI" -f "$p" -l "$p" -singlefile -- "$1" "${out%.*}" || rc=1
+      if [[ $sfx != "$fmt" && -f "${out%.*}.$sfx" ]]; then
+        mv -f "${out%.*}.$sfx" "$out" || rc=1
+      fi
+      [[ -f $out ]] || rc=1
+    done
+    OUT_NOTE="${base}-1.${fmt} … -${pages}.${fmt} ($pages pages)"
+    OUT_NOTE=${OUT_NOTE##*/}
+  else
+    pdftoppm "-$pp" -r "$PDF_DPI" -singlefile -- "$1" "$base" || rc=1
+    if [[ $sfx != "$fmt" && -f "$base.$sfx" ]]; then
+      mv -f "$base.$sfx" "$2" || rc=1
+    fi
+    [[ -f $2 ]] || rc=1
+  fi
+  return $rc
+}
+
+doc_convert() { # $1=src $2=dst $3=target-ext — any LibreOffice-backed document
+  command -v soffice >/dev/null || { echo "  ✗ libreoffice not installed" >&2; return 1; }
+  local tmpd stem filter=$3
+  [[ $filter == htm ]] && filter=html
+  tmpd=$(mktemp -d) || return 1
+  stem=${1##*/}; stem=${stem%.*}
+  soffice --headless --norestore \
+    "-env:UserInstallation=file://${XDG_RUNTIME_DIR:-/tmp}/omniconvert-lo" \
+    --convert-to "$filter" --outdir "$tmpd" "$(safe "$1")" >/dev/null 2>&1
+  # soffice names the output after the source stem; html may land as .html
+  local produced="$tmpd/$stem.$filter"
+  [[ -f $produced ]] || produced=$(find "$tmpd" -maxdepth 1 -type f -name "$stem.*" | head -1)
+  if [[ -n ${produced:-} && -f $produced ]]; then
+    mv -f "$produced" "$2"; rm -rf "$tmpd"; return 0
+  fi
+  rm -rf "$tmpd"
+  echo "  ✗ libreoffice could not export $1 to .$3" >&2
+  return 1
+}
+
+convert_one() { # $1=src $2=target-ext
+  local src=$1 target=$2 se dst rc
+  OUT_NOTE=''   # a converter may set this when it writes more than one file
+  se=$(ext "$src"); se=${se,,}
+
+  # Reject the pair up front, using the same table the menu is built from.
+  # Capture into variables rather than piping: `grep -q` exits on first match,
+  # which SIGPIPEs targets_for, and under `pipefail` that fails the pipeline even
+  # though the match succeeded.
+  local runnable possible tool
+  runnable=$(targets_for "$se" 2>/dev/null)
+  if ! grep -qxF "$target" <<<"$runnable"; then
+    if ! possible=$(targets_for "$se" nocheck 2>/dev/null); then
+      echo "  ✗ unsupported input type .$se: $src" >&2
+    elif grep -qxF "$target" <<<"$possible"; then
+      # The pair is fine; the tool that performs it just isn't installed.
+      tool=$(needs_tool "$se" "$target")
+      echo "  ✗ .$se → .$target needs ${tool:-a converter} — not installed" >&2
+    else
+      echo "  ✗ .$se → .$target not supported: $src" >&2
+    fi
+    return 1
+  fi
+
+  dst=$(fresh_path "$(dst_for "$src" "$target")")
+  if [[ $se == pdf ]]; then
+    pdf_to_img "$(safe "$src")" "$dst"
+  elif [[ $se =~ $WDOC_IN_RE || $se =~ $WEB_IN_RE || $se =~ $SHEET_IN_RE || $se =~ $PRES_IN_RE ]]; then
+    doc_convert "$src" "$dst" "$target"
+  elif [[ $se =~ $IMG_IN_RE ]]; then
+    img_convert "$(safe "$src")" "$(safe "$dst")"
+  elif [[ $se =~ $AUD_IN_RE ]]; then
+    audio_args "$target"
+    "${FF[@]}" -i "$(safe "$src")" ${A_ARGS[@]+"${A_ARGS[@]}"} "$(safe "$dst")"
+  elif [[ $se =~ $VID_IN_RE && $target =~ $AUD_OUT_RE ]]; then
+    audio_args "$target"
+    "${FF[@]}" -i "$(safe "$src")" -vn ${A_ARGS[@]+"${A_ARGS[@]}"} "$(safe "$dst")"
+  elif [[ $se =~ $VID_IN_RE && $target == gif ]]; then
+    vid_to_gif "$(safe "$src")" "$(safe "$dst")"
+  elif [[ $se =~ $VID_IN_RE ]]; then
+    video_args "$target"
+    "${FF[@]}" -i "$(safe "$src")" ${V_ARGS[@]+"${V_ARGS[@]}"} "$(safe "$dst")"
+  else
+    echo "  ✗ .$se → .$target not supported: $src" >&2; return 1
+  fi
+  rc=$?
+  (( rc == 0 )) && echo "  ✓ $src → ${OUT_NOTE:-${dst##*/}}"
+  return $rc
+}
+
+main() {
+  local target=${1:-}
+  [[ $# -gt 0 ]] && shift
+  case $target in
+    list)    list; exit 0 ;;
+    targets) targets "$@"; exit $? ;;
+    ""|-h|--help|help) usage; exit 0 ;;
+  esac
+  target=${target,,}; target=${target#.}
+
+  # Interactive terminal → normal output. No terminal (spawned from yazi etc.)
+  # → log to file — unless OMNICONVERT_NO_LOG=1 (the yazi plugin reads the pipe).
+  local TTY=0
+  { [[ -t 2 ]] || [[ ${OMNICONVERT_NO_LOG:-} == 1 ]]; } && TTY=1
+  if [[ $TTY == 0 ]]; then
+    mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}"
+    exec >>"${XDG_STATE_HOME:-$HOME/.local/state}/omniconvert.log" 2>&1
+    FF=(ffmpeg -nostdin -hide_banner -loglevel error -nostats -y)
+  else
+    FF=(ffmpeg -nostdin -hide_banner -y)
+  fi
+
+  local MERGE=0
+  while [[ ${1:-} == --* ]]; do
+    case $1 in --merge) MERGE=1 ;; esac
+    shift
+  done
+  (( $# )) || { usage >&2; exit 1; }
+
+  [[ $target =~ $IMG_OUT_RE || $target =~ $AUD_OUT_RE || $target =~ $VID_OUT_RE || $target =~ $DOC_OUT_RE ]] || {
+    echo "omniconvert: unsupported target '.$target' (run: omniconvert list)" >&2; exit 1; }
+
+  if (( MERGE )); then
+    [[ $target == pdf ]] || { echo "--merge only makes sense for pdf" >&2; exit 1; }
+    local dst f
+    dst=$(fresh_path "$(dst_for "$1" pdf)")
+    local args=()
+    for f in "$@"; do args+=("$(safe "$f")"); done
+    if magick -quality "$JPG_QUALITY" "${args[@]}" "$(safe "$dst")"; then
+      echo "  ✓ merged $# files → ${dst##*/}"
+      notify "omniconvert" "Merged $# files → ${dst##*/}"
+      exit 0
+    fi
+    notify -u critical "omniconvert" "Merge failed (see ~/.local/state/omniconvert.log)"
+    exit 1
+  fi
+
+  local ok=0 fail=0 src
+  for src in "$@"; do
+    if [[ -f $src ]] && convert_one "$src" "$target"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done
+  local msg="Converted $ok file(s) to .$target"
+  if (( fail )); then
+    msg+=", $fail failed"
+    notify -u critical "omniconvert" "$msg"
+  else
+    notify "omniconvert" "$msg"
+  fi
+  echo "$msg"
+  (( fail == 0 ))
+}
+
+main "$@"
