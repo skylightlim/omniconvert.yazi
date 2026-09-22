@@ -13,6 +13,9 @@ AVIF_QUALITY=${AVIF_QUALITY:-55}  HEIC_QUALITY=${HEIC_QUALITY:-80}
 PDF_DPI=${PDF_DPI:-200}           GIF_FPS=${GIF_FPS:-12}
 GIF_WIDTH=${GIF_WIDTH:-720}       MP3_VBR=${MP3_VBR:-2}
 VIDEO_CRF=${VIDEO_CRF:-23}
+# Markdown/OCR. The OCR language is worked out at run time (see ocr_lang); a
+# PDF with less than PDF_TEXT_MIN characters of text layer counts as a scan.
+OCR_DPI=${OCR_DPI:-300}           PDF_TEXT_MIN=${PDF_TEXT_MIN:-64}
 
 # ---------- what can come in ----------
 IMG_IN_RE='^(bmp|gif|jpe?g|p[bgp]m|tga|tiff?|png|webp|avif|heic|heif|jxl|ico|svg|psd|dng|cr2|cr3|nef|arw|orf|rw2|raf|pef)$'
@@ -23,21 +26,23 @@ WDOC_IN_RE='^(doc|docx|odt|rtf|txt|md|markdown|fodt|dotx?)$'   # full Writer
 WEB_IN_RE='^(html?|xhtml)$'                                    # Writer/Web (limited exports)
 SHEET_IN_RE='^(xls|xlsx|xlsm|ods|fods|csv|tsv)$'               # Calc
 PRES_IN_RE='^(ppt|pptx|pps|ppsx|odp|fodp)$'                    # Impress
+# Raster formats tesseract reads itself; anything else magick rasterises first.
+TESS_IN_RE='^(png|jpe?g|tiff?|bmp|p[bgp]m|gif|webp)$'
 
 # ---------- what can go out ----------
-IMG_OUT='png jpg webp avif heic jxl gif bmp tiff tga ico pdf'
+IMG_OUT='png jpg webp avif heic jxl gif bmp tiff tga ico pdf md'
 AUD_OUT='mp3 opus aac m4a flac wav ogg wma'
 VID_OUT='mp4 webm mkv mov avi flv wmv gif'
-PDF_OUT='png jpg webp avif tiff'          # pdf -> raster images
-WDOC_OUT='pdf docx odt rtf txt html'      # verified against LibreOffice Writer
-WEB_OUT='pdf odt txt'                     # Writer/Web cannot emit docx/rtf
-SHEET_OUT='pdf xlsx ods csv'
-PRES_OUT='pdf pptx odp'
+PDF_OUT='png jpg webp avif tiff md'       # pdf -> raster images, or text
+WDOC_OUT='pdf docx odt rtf txt html md'   # verified against LibreOffice Writer
+WEB_OUT='pdf odt txt md'                  # Writer/Web cannot emit docx/rtf
+SHEET_OUT='pdf xlsx ods csv md'
+PRES_OUT='pdf pptx odp md'
 
 IMG_OUT_RE='^(png|jpe?g|webp|avif|heic|heif|jxl|gif|bmp|tga|tiff?|ico|pdf)$'
 AUD_OUT_RE='^(mp3|opus|aac|m4a|flac|wav|ogg|wma)$'
 VID_OUT_RE='^(mp4|webm|mkv|mov|avi|flv|wmv|gif)$'
-DOC_OUT_RE='^(pdf|docx|odt|rtf|txt|html?|xlsx|ods|csv|pptx|odp)$'
+DOC_OUT_RE='^(pdf|docx|odt|rtf|txt|html?|xlsx|ods|csv|pptx|odp|md)$'
 
 usage() { cat <<'EOF'
 omniconvert — FileConverter-style conversion
@@ -53,6 +58,7 @@ Examples:
   omniconvert mp4 clip.mov            omniconvert pdf letter.docx
   omniconvert jpg scan.pdf            omniconvert pdf --merge a.jpg b.png
   omniconvert docx notes.md           omniconvert targets photo.png
+  omniconvert md report.xlsx          omniconvert md scan.pdf
 EOF
 }
 
@@ -69,6 +75,8 @@ Docs    in : doc docx odt rtf txt md        -> $WDOC_OUT
              html htm                       -> $WEB_OUT
              xls xlsx ods csv tsv           -> $SHEET_OUT
              ppt pptx odp                   -> $PRES_OUT
+Markdown   : every document, spreadsheet, deck, PDF and image above reaches
+             .md — scanned PDFs and images via OCR, everything else directly
 EOF
 }
 
@@ -104,9 +112,35 @@ dst_for() { # $1=src  $2=target-ext
 # ---------- capability query (single source of truth for the yazi plugin) ----------
 have() { command -v "$1" >/dev/null 2>&1; }
 
-needs_tool() { # $1=src-ext $2=target-ext -> prints the command that does this pair
+missing_tool() { # $@=commands -> prints the first one this machine doesn't have
+  local c
+  for c in "$@"; do have "$c" || { printf '%s' "$c"; return 0; }; done
+  return 1
+}
+
+# Markdown is the one target each family reaches by a different route, so it is
+# keyed on the pair and not on the input alone: LibreOffice has exported Markdown
+# since 26.8 but only from Writer, while markitdown covers Calc and Impress and
+# cannot read OpenDocument at all.
+md_route() { # $1=src-ext -> every command the route needs
+  local e=$1
+  case $e in
+    ods|fods|odp|fodp) printf 'soffice markitdown'; return 0 ;;   # hop via OOXML
+    pdf)               printf 'pdftotext'; return 0 ;;            # +tesseract if scanned
+  esac
+  if   [[ $e =~ $WDOC_IN_RE ]]; then printf 'soffice'
+  elif [[ $e =~ $WEB_IN_RE || $e =~ $SHEET_IN_RE || $e =~ $PRES_IN_RE ]]; then printf 'markitdown'
+  elif [[ $e =~ $TESS_IN_RE ]]; then printf 'tesseract'
+  elif [[ $e =~ $IMG_IN_RE ]];  then printf 'magick tesseract'
+  else return 1
+  fi
+}
+
+needs_tool() { # $1=src-ext $2=target-ext -> prints the command(s) that do this pair
   local e=$1 t=$2
-  if [[ $e == pdf ]]; then
+  if [[ $t == md ]]; then
+    md_route "$e"
+  elif [[ $e == pdf ]]; then
     case $t in
       png|jpg|jpeg|tif|tiff) printf 'pdftoppm' ;;
       *)                     printf 'magick' ;;
@@ -135,7 +169,7 @@ targets_for() { # -> one valid target per line, self excluded
   elif [[ $e =~ $VID_IN_RE ]];   then set="$VID_OUT $AUD_OUT"
   else return 1
   fi
-  local t tool
+  local t tools
   for t in $set; do
     # skip a no-op conversion (jpg/jpeg and tif/tiff count as the same format)
     case "$e:$t" in
@@ -144,8 +178,9 @@ targets_for() { # -> one valid target per line, self excluded
     [[ $t == "$e" ]] && continue
     # Don't offer what this machine can't actually run.
     if [[ -z $nocheck ]]; then
-      tool=$(needs_tool "$e" "$t") || continue
-      have "$tool" || continue
+      tools=$(needs_tool "$e" "$t") || continue
+      # unquoted on purpose: a route may need more than one command
+      missing_tool $tools >/dev/null && continue
     fi
     printf '%s\n' "$t"
   done
@@ -276,6 +311,120 @@ doc_convert() { # $1=src $2=dst $3=target-ext — any LibreOffice-backed documen
   return 1
 }
 
+ocr_lang() { # tesseract has no autodetect, so every language has to be named
+  [[ -n ${OMNICONVERT_OCR_LANG:-} ]] && { printf '%s' "$OMNICONVERT_OCR_LANG"; return 0; }
+  local langs
+  langs=$(tesseract --list-langs 2>/dev/null)   # captured, not piped, on purpose
+  if grep -qxF chi_sim <<<"$langs"; then printf 'eng+chi_sim'; else printf 'eng'; fi
+}
+
+ocr() { # $1=image -> recognised text on stdout
+  # preserve_interword_spaces is not cosmetic: without it tesseract puts a space
+  # between every CJK character (季 度 报 告). It also keeps column alignment on
+  # Latin text, which matches what pdftotext -layout does on the other PDF route.
+  tesseract "$(safe "$1")" - -l "$(ocr_lang)" -c preserve_interword_spaces=1 2>/dev/null
+}
+
+markitdown_to() { # $1=src $2=dst
+  local tmp
+  tmp=$(mktemp) || return 1
+  if ! markitdown -o "$tmp" -- "$1" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "  ✗ markitdown could not read $1" >&2
+    return 1
+  fi
+  # markitdown ends its output without a newline; text tools expect one.
+  [[ -s $tmp && $(tail -c1 "$tmp") ]] && printf '\n' >> "$tmp"
+  mv -f "$tmp" "$2"
+}
+
+hop_to_md() { # $1=src $2=dst $3=intermediate ext
+  # OpenDocument has no direct route to Markdown: LibreOffice will not export it
+  # from Calc or Impress, and markitdown cannot read ODF at all. So hand the file
+  # between them through a temporary OOXML copy the user never sees.
+  local tmpd stem rc
+  tmpd=$(mktemp -d) || return 1
+  stem=${1##*/}; stem=${stem%.*}
+  soffice --headless --norestore \
+    "-env:UserInstallation=file://${XDG_RUNTIME_DIR:-/tmp}/omniconvert-lo" \
+    --convert-to "$3" --outdir "$tmpd" "$(safe "$1")" >/dev/null 2>&1
+  if [[ -f "$tmpd/$stem.$3" ]]; then
+    markitdown_to "$tmpd/$stem.$3" "$2"; rc=$?
+  else
+    echo "  ✗ libreoffice could not open $1" >&2; rc=1
+  fi
+  rm -rf "$tmpd"
+  return $rc
+}
+
+pdf_to_md() { # $1=src $2=dst
+  # A born-digital PDF carries a text layer; a scan carries (almost) none. Only
+  # the second is worth the time and the accuracy loss of OCR.
+  local txt n p rc=0 tmpd
+  txt=$(pdftotext -layout -- "$(safe "$1")" - 2>/dev/null)
+  n=$(pdfinfo "$(safe "$1")" 2>/dev/null | awk '/^Pages:/{print $2; exit}'); n=${n:-1}
+  if (( ${#txt} >= PDF_TEXT_MIN )); then
+    # pdftotext separates pages with a form feed; turning those into headings
+    # makes both routes out of a PDF produce the same shape of Markdown.
+    txt=${txt%$'\f'}
+    awk -v RS='\f' '{ printf "## Page %d\n\n%s\n", NR, $0 }' <<<"$txt" > "$2"
+    return 0
+  fi
+  have tesseract || {
+    echo "  ✗ $1 has no text layer — OCR needs tesseract, not installed" >&2
+    return 1
+  }
+  tmpd=$(mktemp -d) || return 1
+  : > "$2"
+  for ((p = 1; p <= n; p++)); do
+    if pdftoppm -png -r "$OCR_DPI" -f "$p" -l "$p" -singlefile -- "$(safe "$1")" "$tmpd/page"; then
+      printf '## Page %d\n\n' "$p" >> "$2"
+      ocr "$tmpd/page.png" >> "$2"
+      printf '\n' >> "$2"
+    else
+      rc=1
+    fi
+    rm -f "$tmpd/page.png"
+  done
+  rm -rf "$tmpd"
+  (( rc == 0 )) && OUT_NOTE="${2##*/} (OCR, $n page(s))"
+  return $rc
+}
+
+img_to_md() { # $1=src $2=dst
+  # tesseract reads common raster formats itself; vector, raw and layered files
+  # go through magick first, page 0 only so a PSD or multi-page TIFF is defined.
+  local e src=$1 tmpd="" rc=0
+  e=$(ext "$1"); e=${e,,}
+  if ! [[ $e =~ $TESS_IN_RE ]]; then
+    tmpd=$(mktemp -d) || return 1
+    if ! magick "$(safe "$1")[0]" "$tmpd/page.png" >/dev/null 2>&1; then
+      rm -rf "$tmpd"
+      echo "  ✗ could not rasterise $1 for OCR" >&2
+      return 1
+    fi
+    src="$tmpd/page.png"
+  fi
+  ocr "$src" > "$2" || rc=1
+  [[ -n $tmpd ]] && rm -rf "$tmpd"
+  return $rc
+}
+
+md_convert() { # $1=src $2=dst — one entry point, one route per input family
+  local e; e=$(ext "$1"); e=${e,,}
+  case $e in
+    ods|fods) hop_to_md "$1" "$2" xlsx; return $? ;;
+    odp|fodp) hop_to_md "$1" "$2" pptx; return $? ;;
+    pdf)      pdf_to_md "$1" "$2";      return $? ;;
+  esac
+  if   [[ $e =~ $WDOC_IN_RE ]]; then doc_convert "$1" "$2" md
+  elif [[ $e =~ $WEB_IN_RE || $e =~ $SHEET_IN_RE || $e =~ $PRES_IN_RE ]]; then
+    markitdown_to "$1" "$2"
+  elif [[ $e =~ $IMG_IN_RE ]]; then img_to_md "$1" "$2"
+  else return 1
+  fi
+}
+
 convert_one() { # $1=src $2=target-ext
   local src=$1 target=$2 se dst rc
   OUT_NOTE=''   # a converter may set this when it writes more than one file
@@ -292,7 +441,7 @@ convert_one() { # $1=src $2=target-ext
       echo "  ✗ unsupported input type .$se: $src" >&2
     elif grep -qxF "$target" <<<"$possible"; then
       # The pair is fine; the tool that performs it just isn't installed.
-      tool=$(needs_tool "$se" "$target")
+      tool=$(missing_tool $(needs_tool "$se" "$target"))
       echo "  ✗ .$se → .$target needs ${tool:-a converter} — not installed" >&2
     else
       echo "  ✗ .$se → .$target not supported: $src" >&2
@@ -301,7 +450,9 @@ convert_one() { # $1=src $2=target-ext
   fi
 
   dst=$(fresh_path "$(dst_for "$src" "$target")")
-  if [[ $se == pdf ]]; then
+  if [[ $target == md ]]; then
+    md_convert "$src" "$dst"
+  elif [[ $se == pdf ]]; then
     pdf_to_img "$(safe "$src")" "$dst"
   elif [[ $se =~ $WDOC_IN_RE || $se =~ $WEB_IN_RE || $se =~ $SHEET_IN_RE || $se =~ $PRES_IN_RE ]]; then
     doc_convert "$src" "$dst" "$target"
@@ -335,6 +486,7 @@ main() {
     ""|-h|--help|help) usage; exit 0 ;;
   esac
   target=${target,,}; target=${target#.}
+  [[ $target == markdown ]] && target=md
 
   # Interactive terminal → normal output. No terminal (spawned from yazi etc.)
   # → log to file — unless OMNICONVERT_NO_LOG=1 (the yazi plugin reads the pipe).

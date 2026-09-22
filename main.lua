@@ -7,6 +7,7 @@
 ---
 ---   plugin omniconvert            -- open the menu (the normal way to use this)
 ---   plugin omniconvert -- webp    -- skip the menu, convert straight to .webp
+---   plugin omniconvert -- md      -- straight to Markdown (bound to `c Z m`)
 
 -- Single-keypress mnemonic per format. Keys only have to be unique within one
 -- menu, so `o` can be Opus for audio and ODT for documents.
@@ -22,6 +23,9 @@ local KEYS = {
 	-- documents
 	docx = "D", odt = "o", rtf = "r", txt = "t", html = "h",
 	xlsx = "x", ods = "s", csv = "C", pptx = "p", odp = "P",
+	-- `m` is M4A above too, which is safe: no input reaches both. Markdown is
+	-- offered for documents, PDFs and images, M4A only for audio and video.
+	md = "m",
 }
 
 local LABELS = {
@@ -44,6 +48,7 @@ local LABELS = {
 	html = "HTML — web page",      xlsx = "XLSX — Excel",
 	ods = "ODS — LibreOffice Calc", csv = "CSV — plain table",
 	pptx = "PPTX — PowerPoint",    odp = "ODP — LibreOffice Impress",
+	md = "Markdown — portable text",
 }
 
 -- Keys handed out to a format the tables above don't know about, so a format
@@ -137,7 +142,18 @@ local function build_cands(targets, src_ext, merge_ok)
 		return nil
 	end
 
+	-- Markdown is what this is reached for most, so it leads the menu and claims
+	-- `m` before anything else can, whatever order the backend printed.
+	local ordered = {}
 	for _, t in ipairs(targets) do
+		if t == "md" then
+			table.insert(ordered, 1, t)
+		else
+			ordered[#ordered + 1] = t
+		end
+	end
+
+	for _, t in ipairs(ordered) do
 		local key = claim(KEYS[t])
 		if key then
 			local desc = LABELS[t] or t:upper()
